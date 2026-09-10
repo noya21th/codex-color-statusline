@@ -1,0 +1,154 @@
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs	2026-09-10 16:13:39
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs	2026-09-10 16:13:39
+@@ -111,10 +111,14 @@
+             spans.push(STATUS_LINE_SEPARATOR.dim());
+         }
+         let style = if use_theme_colors {
+-            let accent = StatusLineAccent::for_item(item);
+-            soften_status_line_style(
+-                theme_style_for_accent(accent).unwrap_or_else(|| accent.fallback_style()),
+-            )
++            if let Some(used) = used_percent_for_segment(item, &text) {
++                Style::default().fg(UsageLevel::from_used_percent(used).color())
++            } else {
++                let accent = StatusLineAccent::for_item(item);
++                soften_status_line_style(
++                    theme_style_for_accent(accent).unwrap_or_else(|| accent.fallback_style()),
++                )
++            }
+         } else {
+             Style::default().dim()
+         };
+@@ -129,6 +133,67 @@
+     (!spans.is_empty()).then(|| Line::from(spans))
+ }
+ 
++/// Headroom bands for quota-like items (5h/weekly limits and context usage).
++///
++/// Bands use the used percent so `N% left` and `N% used` share one scale:
++/// under 50% used is healthy, 50% warns, 70% is high, and 85% used (15% or
++/// less remaining) is critical.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum UsageLevel {
++    Healthy,
++    Warn,
++    High,
++    Critical,
++}
++
++impl UsageLevel {
++    fn from_used_percent(used: i64) -> Self {
++        if used >= 85 {
++            Self::Critical
++        } else if used >= 70 {
++            Self::High
++        } else if used >= 50 {
++            Self::Warn
++        } else {
++            Self::Healthy
++        }
++    }
++
++    #[allow(clippy::disallowed_methods)]
++    fn color(self) -> Color {
++        match self {
++            Self::Healthy => Color::Rgb(63, 185, 80),
++            Self::Warn => Color::Rgb(210, 153, 34),
++            Self::High => Color::Rgb(240, 136, 62),
++            Self::Critical => Color::Rgb(248, 81, 73),
++        }
++    }
++}
++
++/// Reads the used percent from quota-like segments rendered as `5h 84% left`,
++/// `weekly 97% left`, `Context 12% used`, or `Context 88% left`.
++///
++/// Returns `None` for other items or unexpected text so they keep theme colors.
++fn used_percent_for_segment(item: StatusLineItem, text: &str) -> Option<i64> {
++    if !matches!(
++        item,
++        StatusLineItem::FiveHourLimit
++            | StatusLineItem::WeeklyLimit
++            | StatusLineItem::ContextUsed
++            | StatusLineItem::ContextRemaining
++    ) {
++        return None;
++    }
++    let (head, tail) = text.rsplit_once('%')?;
++    let percent: i64 = head.rsplit(' ').next()?.parse().ok()?;
++    let used = match tail.trim() {
++        "used" => percent,
++        "left" => 100 - percent,
++        _ => return None,
++    };
++    Some(used.clamp(0, 100))
++}
++
+ fn soften_status_line_style(mut style: Style) -> Style {
+     if let Some(fg) = style.fg {
+         style.fg = Some(soften_status_line_color(fg));
+@@ -235,11 +300,63 @@
+         assert_eq!(line.spans[0].style.fg, Some(Color::Red));
+         assert!(!line.spans[0].style.add_modifier.contains(Modifier::DIM));
+         assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
+-        assert_eq!(line.spans[2].style.fg, Some(Color::Green));
++        assert_eq!(line.spans[2].style.fg, Some(UsageLevel::Healthy.color()));
+         assert!(!line.spans[2].style.add_modifier.contains(Modifier::DIM));
+     }
+ 
+     #[test]
++    fn usage_levels_follow_headroom_thresholds() {
++        assert_eq!(UsageLevel::from_used_percent(0), UsageLevel::Healthy);
++        assert_eq!(UsageLevel::from_used_percent(49), UsageLevel::Healthy);
++        assert_eq!(UsageLevel::from_used_percent(50), UsageLevel::Warn);
++        assert_eq!(UsageLevel::from_used_percent(69), UsageLevel::Warn);
++        assert_eq!(UsageLevel::from_used_percent(70), UsageLevel::High);
++        assert_eq!(UsageLevel::from_used_percent(84), UsageLevel::High);
++        assert_eq!(UsageLevel::from_used_percent(85), UsageLevel::Critical);
++        assert_eq!(UsageLevel::from_used_percent(100), UsageLevel::Critical);
++    }
++
++    #[test]
++    fn quota_segments_color_by_remaining_headroom() {
++        let line = status_line_from_segments_with_resolver(
++            [
++                (StatusLineItem::FiveHourLimit, "5h 84% left".to_string()),
++                (StatusLineItem::WeeklyLimit, "weekly 50% left".to_string()),
++                (StatusLineItem::ContextUsed, "Context 72% used".to_string()),
++                (StatusLineItem::ContextRemaining, "Context 15% left".to_string()),
++            ],
++            /*use_theme_colors*/ true,
++            |_| Some(Style::default().red()),
++        )
++        .expect("status line");
++
++        assert_eq!(
++            line_text(&line),
++            "5h 84% left · weekly 50% left · Context 72% used · Context 15% left"
++        );
++        assert_eq!(line.spans[0].style.fg, Some(UsageLevel::Healthy.color()));
++        assert_eq!(line.spans[2].style.fg, Some(UsageLevel::Warn.color()));
++        assert_eq!(line.spans[4].style.fg, Some(UsageLevel::High.color()));
++        assert_eq!(line.spans[6].style.fg, Some(UsageLevel::Critical.color()));
++    }
++
++    #[test]
++    fn quota_segments_without_percent_keep_theme_colors() {
++        let line = status_line_from_segments_with_resolver(
++            [
++                (StatusLineItem::FiveHourLimit, "5h unavailable".to_string()),
++                (StatusLineItem::ModelName, "gpt-5 50% left".to_string()),
++            ],
++            /*use_theme_colors*/ true,
++            |_| None,
++        )
++        .expect("status line");
++
++        assert_eq!(line.spans[0].style.fg, Some(Color::Magenta));
++        assert_eq!(line.spans[2].style.fg, Some(Color::Cyan));
++    }
++
++    #[test]
+     fn thread_usage_items_share_an_accent_and_dim_separator() {
+         let line = status_line_from_segments_with_resolver(
+             [

@@ -1,0 +1,15 @@
+codex-color-statusline
+Copyright 2026 noya21th
+
+This project contains a patch for OpenAI Codex (https://github.com/openai/codex),
+licensed under the Apache License, Version 2.0. The patch includes portions of
+the Codex source code. The NOTICE file of OpenAI Codex follows.
+
+--------------------------------------------------------------------------------
+
+OpenAI Codex
+Copyright 2025 OpenAI
+
+This project includes code derived from [Ratatui](https://github.com/ratatui/ratatui), licensed under the MIT license.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers
