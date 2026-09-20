@@ -1,0 +1,504 @@
+--- a/codex-rs/tui/src/status/rate_limits.rs
++++ b/codex-rs/tui/src/status/rate_limits.rs
+@@ -71,6 +71,8 @@
+     pub used_percent: f64,
+     /// Human-readable local reset time.
+     pub resets_at: Option<String>,
++    /// Raw local reset time, kept so the status line can render a live countdown.
++    pub resets_at_local: Option<DateTime<Local>>,
+     /// Window length in minutes when provided by the server.
+     pub window_minutes: Option<i64>,
+ }
+@@ -86,6 +88,7 @@
+         Self {
+             used_percent: f64::from(window.used_percent),
+             resets_at,
++            resets_at_local: resets_at_utc,
+             window_minutes: window.window_duration_mins,
+         }
+     }
+@@ -447,6 +450,7 @@
+         RateLimitWindowDisplay {
+             used_percent,
+             resets_at: Some("soon".to_string()),
++            resets_at_local: None,
+             window_minutes: Some(300),
+         }
+     }
+@@ -509,11 +513,13 @@
+             primary: Some(RateLimitWindowDisplay {
+                 used_percent: 20.0,
+                 resets_at: Some("soon".to_string()),
++                resets_at_local: None,
+                 window_minutes: Some(60),
+             }),
+             secondary: Some(RateLimitWindowDisplay {
+                 used_percent: 40.0,
+                 resets_at: Some("later".to_string()),
++                resets_at_local: None,
+                 window_minutes: Some(2 * 60),
+             }),
+             credits: None,
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -69,6 +69,7 @@
+         primary: Some(RateLimitWindowDisplay {
+             used_percent: 20.0,
+             resets_at: Some("soon".to_string()),
++            resets_at_local: None,
+             window_minutes: Some(300),
+         }),
+         secondary: None,
+@@ -1788,11 +1789,13 @@
+             primary: Some(RateLimitWindowDisplay {
+                 used_percent: 45.0,
+                 resets_at: Some("soon".to_string()),
++                resets_at_local: None,
+                 window_minutes: Some(300),
+             }),
+             secondary: Some(RateLimitWindowDisplay {
+                 used_percent: 30.0,
+                 resets_at: Some("later".to_string()),
++                resets_at_local: None,
+                 window_minutes: Some(10_080),
+             }),
+             credits: None,
+--- a/codex-rs/tui/src/chatwidget/status_controls.rs
++++ b/codex-rs/tui/src/chatwidget/status_controls.rs
+@@ -440,6 +440,10 @@
+             .unwrap_or_default()
+     }
+ 
++    /// Upstream's plain `{label} {n}% left` rendering. Both limit items now use
++    /// [`Self::status_line_limit_countdown_display`] instead; kept so the plain
++    /// form stays one edit away.
++    #[allow(dead_code)]
+     pub(super) fn status_line_limit_display(
+         &self,
+         window: Option<&RateLimitWindowDisplay>,
+@@ -448,6 +452,29 @@
+         let window = window?;
+         let remaining = (100.0f64 - window.used_percent).clamp(0.0f64, 100.0f64);
+         Some(format!("{label} {remaining:.0}% left"))
++    }
++
++    /// Usage window as a meter: `weekly ░░░░░░░░░░ 15% (resets in 20h 47m)`.
++    ///
++    /// The percent is the share *used*, so that it reads the same way as the
++    /// bar next to it. The reset clause is dropped when the server sent no
++    /// reset time, or when the snapshot's reset instant has already passed and
++    /// a countdown would be misleading.
++    pub(super) fn status_line_limit_countdown_display(
++        &self,
++        window: Option<&RateLimitWindowDisplay>,
++        label: &str,
++    ) -> Option<String> {
++        let window = window?;
++        let used = window.used_percent.clamp(0.0f64, 100.0f64).round() as i64;
++        let bar = usage_bar(used);
++        match window
++            .resets_at_local
++            .and_then(|resets_at| format_limit_countdown(resets_at, chrono::Local::now()))
++        {
++            Some(countdown) => Some(format!("{label} {bar} {used}% (resets in {countdown})")),
++            None => Some(format!("{label} {bar} {used}%")),
++        }
+     }
+ 
+     pub(super) fn status_line_reasoning_effort_label(
+@@ -457,5 +484,116 @@
+             None | Some(ReasoningEffortConfig::None) => "default".to_string(),
+             Some(effort) => effort.as_str().to_string(),
+         }
++    }
++}
++
++/// Width of the usage meter drawn next to a limit, in cells.
++const USAGE_BAR_WIDTH: usize = 10;
++
++/// Ten-cell meter for a used percent, filled cells first (`█░░░░░░░░░`).
++///
++/// Cells round down, so a window only shows its first filled cell once it is
++/// genuinely 10% used and an almost-untouched window reads as empty.
++fn usage_bar(used_percent: i64) -> String {
++    let used = used_percent.clamp(0, 100) as usize;
++    let filled = (used * USAGE_BAR_WIDTH / 100).min(USAGE_BAR_WIDTH);
++    (0..USAGE_BAR_WIDTH)
++        .map(|cell| if cell < filled { '█' } else { '░' })
++        .collect()
++}
++
++/// Time left until a usage window resets, in English short units.
++///
++/// Past one day it degrades to whole days and hours (`6d 21h`) because the
++/// status line is not redrawn every second; below a day it keeps minutes
++/// (`20h 47m`, `47m`). Returns `None` once the instant has passed.
++fn format_limit_countdown(
++    resets_at: chrono::DateTime<chrono::Local>,
++    now: chrono::DateTime<chrono::Local>,
++) -> Option<String> {
++    const SECONDS_PER_MINUTE: i64 = 60;
++    const SECONDS_PER_HOUR: i64 = 60 * SECONDS_PER_MINUTE;
++    const SECONDS_PER_DAY: i64 = 24 * SECONDS_PER_HOUR;
++
++    let seconds = resets_at.signed_duration_since(now).num_seconds();
++    if seconds <= 0 {
++        return None;
++    }
++    let days = seconds / SECONDS_PER_DAY;
++    let hours = (seconds % SECONDS_PER_DAY) / SECONDS_PER_HOUR;
++    let minutes = (seconds % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE;
++    Some(if days > 0 {
++        format!("{days}d {hours}h")
++    } else if hours > 0 {
++        format!("{hours}h {minutes}m")
++    } else {
++        format!("{minutes}m")
++    })
++}
++
++#[cfg(test)]
++mod status_line_countdown_tests {
++    use super::format_limit_countdown;
++    use chrono::Duration;
++    use chrono::Local;
++    use pretty_assertions::assert_eq;
++
++    #[test]
++    fn usage_bar_fills_by_tenths_and_rounds_down() {
++        assert_eq!(super::usage_bar(0), "░░░░░░░░░░");
++        assert_eq!(super::usage_bar(2), "░░░░░░░░░░");
++        assert_eq!(super::usage_bar(9), "░░░░░░░░░░");
++        assert_eq!(super::usage_bar(10), "█░░░░░░░░░");
++        assert_eq!(super::usage_bar(15), "█░░░░░░░░░");
++        assert_eq!(super::usage_bar(50), "█████░░░░░");
++        assert_eq!(super::usage_bar(99), "█████████░");
++        assert_eq!(super::usage_bar(100), "██████████");
+     }
++
++    #[test]
++    fn usage_bar_clamps_out_of_range_input() {
++        assert_eq!(super::usage_bar(-5), "░░░░░░░░░░");
++        assert_eq!(super::usage_bar(140), "██████████");
++    }
++
++    #[test]
++    fn past_one_day_shows_days_and_hours() {
++        let now = Local::now();
++        let resets = now + Duration::seconds(6 * 86_400 + 21 * 3_600 + 30 * 60);
++        assert_eq!(
++            format_limit_countdown(resets, now).as_deref(),
++            Some("6d 21h")
++        );
++    }
++
++    #[test]
++    fn exact_day_boundary_stays_in_days() {
++        let now = Local::now();
++        let resets = now + Duration::seconds(24 * 3_600 + 10);
++        assert_eq!(format_limit_countdown(resets, now).as_deref(), Some("1d 0h"));
++    }
++
++    #[test]
++    fn under_one_day_shows_hours_and_minutes() {
++        let now = Local::now();
++        let resets = now + Duration::seconds(20 * 3_600 + 47 * 60 + 10);
++        assert_eq!(
++            format_limit_countdown(resets, now).as_deref(),
++            Some("20h 47m")
++        );
++    }
++
++    #[test]
++    fn under_one_hour_shows_minutes_only() {
++        let now = Local::now();
++        let resets = now + Duration::seconds(47 * 60 + 5);
++        assert_eq!(format_limit_countdown(resets, now).as_deref(), Some("47m"));
++    }
++
++    #[test]
++    fn already_passed_returns_none_so_caller_falls_back() {
++        let now = Local::now();
++        assert_eq!(format_limit_countdown(now - Duration::seconds(1), now), None);
++        assert_eq!(format_limit_countdown(now, now), None);
++    }
+ }
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -4,7 +4,7 @@
+ //! behavior easier to review without paging through the rest of `chatwidget.rs`.
+ 
+ use super::*;
+-use crate::bottom_pane::status_line_from_segments;
++use crate::bottom_pane::status_line_from_segments_with_usage;
+ use crate::branch_summary;
+ use crate::chatwidget::limit_label_for_window;
+ use crate::chatwidget::rate_limits::get_limits_duration;
+@@ -211,11 +211,12 @@
+         let mut segments = Vec::new();
+         for item in &selections.status_line_items {
+             if let Some(value) = self.status_line_value_for_item(*item) {
+-                segments.push((*item, value));
++                let used_percent = self.status_line_used_percent_for_item(*item);
++                segments.push((*item, value, used_percent));
+             }
+         }
+ 
+-        self.set_status_line(status_line_from_segments(
++        self.set_status_line(status_line_from_segments_with_usage(
+             segments,
+             self.local_settings.tui.status_line_use_colors,
+         ));
+@@ -703,6 +704,21 @@
+     /// Returning `None` means "omit this item for now", not "configuration error". Callers rely on
+     /// this to keep partially available status lines readable while waiting for session, token, or
+     /// git metadata.
++    /// Used percent for segments whose rendered text no longer carries it.
++    ///
++    /// Both limits now render as a meter plus a countdown, so the footer can no
++    /// longer read the headroom back out of the text and needs it straight from
++    /// the snapshot to pick a threshold color.
++    fn status_line_used_percent_for_item(&self, item: StatusLineItem) -> Option<i64> {
++        let snapshot = self.rate_limit_snapshots_by_limit_id.get("codex")?;
++        let (window, _) = match item {
++            StatusLineItem::FiveHourLimit => five_hour_status_window(snapshot)?,
++            StatusLineItem::WeeklyLimit => weekly_status_window(snapshot)?,
++            _ => return None,
++        };
++        Some(window.used_percent.clamp(0.0f64, 100.0f64).round() as i64)
++    }
++
+     pub(super) fn status_line_value(&mut self, item: StatusLineItem) -> Option<String> {
+         match item {
+             StatusLineItem::ModelName => Some(self.model_display_name().to_string()),
+@@ -757,7 +773,7 @@
+                     .get("codex")
+                     .and_then(five_hour_status_window)?;
+                 let label = limit_label_for_window(window.window_minutes, is_secondary);
+-                self.status_line_limit_display(Some(window), &label)
++                self.status_line_limit_countdown_display(Some(window), &label)
+             }
+             StatusLineItem::WeeklyLimit => {
+                 let (window, is_secondary) = self
+@@ -765,7 +781,7 @@
+                     .get("codex")
+                     .and_then(weekly_status_window)?;
+                 let label = limit_label_for_window(window.window_minutes, is_secondary);
+-                self.status_line_limit_display(Some(window), &label)
++                self.status_line_limit_countdown_display(Some(window), &label)
+             }
+             StatusLineItem::CodexVersion => Some(CODEX_CLI_VERSION.to_string()),
+             StatusLineItem::ContextWindowSize => self
+--- a/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
++++ b/codex-rs/tui/src/chatwidget/tests/status_and_layout.rs
+@@ -732,7 +732,7 @@
+ 
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
+-        Some("secondary usage 50% left".to_string())
++        Some("secondary usage █████░░░░░ 50%".to_string())
+     );
+ }
+ 
+@@ -763,11 +763,11 @@
+ 
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
+-        Some("5h 60% left".to_string())
++        Some("5h ████░░░░░░ 40%".to_string())
+     );
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
+-        Some("weekly 6% left".to_string())
++        Some("weekly █████████░ 94%".to_string())
+     );
+ }
+ 
+@@ -798,11 +798,11 @@
+ 
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
+-        Some("monthly 65% left".to_string())
++        Some("monthly ███░░░░░░░ 35%".to_string())
+     );
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
+-        Some("weekly 6% left".to_string())
++        Some("weekly █████████░ 94%".to_string())
+     );
+ }
+ 
+@@ -833,7 +833,7 @@
+     );
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
+-        Some("weekly 91% left".to_string())
++        Some("weekly ░░░░░░░░░░ 9%".to_string())
+     );
+ }
+ 
+@@ -860,7 +860,7 @@
+ 
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::FiveHourLimit),
+-        Some("monthly 65% left".to_string())
++        Some("monthly ███░░░░░░░ 35%".to_string())
+     );
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
+@@ -895,7 +895,7 @@
+     );
+     assert_eq!(
+         chat.status_line_value_for_item(crate::bottom_pane::StatusLineItem::WeeklyLimit),
+-        Some("monthly 65% left".to_string())
++        Some("monthly ███░░░░░░░ 35%".to_string())
+     );
+ }
+ 
+--- a/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_rate_limits.snap
++++ b/codex-rs/tui/src/chatwidget/snapshots/codex_tui__chatwidget__tests__status_line_setup_popup_rate_limits.snap
+@@ -16,5 +16,5 @@
+   [ ] reasoning             Current reasoning level
+   [ ] current-dir           Current working directory
+ 
+-  monthly 65% left · weekly 50% left
++  monthly ███░░░░░░░ 35% · weekly █████░░░░░ 50%
+   Press space to toggle; ←/→ to move; enter to confirm and close; esc to close
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -101,6 +101,7 @@
+ pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
+ pub(crate) use request_user_input::RequestUserInputOverlay;
+ pub(crate) use status_line_style::status_line_from_segments;
++pub(crate) use status_line_style::status_line_from_segments_with_usage;
+ pub(crate) use voice_strip::VoiceStripPhase;
+ pub(crate) use voice_strip::VoiceStripState;
+ mod bottom_pane_view;
+--- a/codex-rs/tui/src/bottom_pane/status_line_style.rs
++++ b/codex-rs/tui/src/bottom_pane/status_line_style.rs
+@@ -91,11 +91,34 @@
+ where
+     I: IntoIterator<Item = (StatusLineItem, String)>,
+ {
+-    status_line_from_segments_with_resolver(segments, use_theme_colors, |accent| {
++    status_line_from_segments_with_usage(
++        segments
++            .into_iter()
++            .map(|(item, text)| (item, text, None)),
++        use_theme_colors,
++    )
++}
++
++/// Same as [`status_line_from_segments`], but a segment may carry its used
++/// percent directly.
++///
++/// Needed because not every quota segment spells the number out any more: the
++/// weekly limit renders a countdown to its reset (`weekly 6d 21h`), so the
++/// headroom color has to come from the snapshot rather than from the text.
++pub(crate) fn status_line_from_segments_with_usage<I>(
++    segments: I,
++    use_theme_colors: bool,
++) -> Option<Line<'static>>
++where
++    I: IntoIterator<Item = (StatusLineItem, String, Option<i64>)>,
++{
++    status_line_from_segments_with_usage_resolver(segments, use_theme_colors, |accent| {
+         foreground_style_for_scopes(accent.scopes())
+     })
+ }
+ 
++/// Two-tuple form kept for the tests, which never pin a used percent.
++#[cfg(test)]
+ fn status_line_from_segments_with_resolver<I, F>(
+     segments: I,
+     use_theme_colors: bool,
+@@ -105,14 +128,34 @@
+     I: IntoIterator<Item = (StatusLineItem, String)>,
+     F: Fn(StatusLineAccent) -> Option<Style>,
+ {
++    status_line_from_segments_with_usage_resolver(
++        segments
++            .into_iter()
++            .map(|(item, text)| (item, text, None)),
++        use_theme_colors,
++        theme_style_for_accent,
++    )
++}
++
++fn status_line_from_segments_with_usage_resolver<I, F>(
++    segments: I,
++    use_theme_colors: bool,
++    theme_style_for_accent: F,
++) -> Option<Line<'static>>
++where
++    I: IntoIterator<Item = (StatusLineItem, String, Option<i64>)>,
++    F: Fn(StatusLineAccent) -> Option<Style>,
++{
+     let mut spans = Vec::new();
+-    for (item, text) in segments {
++    for (item, text, used_percent) in segments {
+         if !spans.is_empty() {
+             spans.push(STATUS_LINE_SEPARATOR.dim());
+         }
+         let style = if use_theme_colors {
+-            if let Some(used) = used_percent_for_segment(item, &text) {
+-                Style::default().fg(UsageLevel::from_used_percent(used).color())
++            if let Some(used) =
++                used_percent.or_else(|| used_percent_for_segment(item, &text))
++            {
++                Style::default().fg(UsageLevel::from_used_percent(used.clamp(0, 100)).color())
+             } else {
+                 let accent = StatusLineAccent::for_item(item);
+                 soften_status_line_style(
+@@ -338,9 +381,51 @@
+         assert_eq!(line.spans[2].style.fg, Some(UsageLevel::Warn.color()));
+         assert_eq!(line.spans[4].style.fg, Some(UsageLevel::High.color()));
+         assert_eq!(line.spans[6].style.fg, Some(UsageLevel::Critical.color()));
++    }
++
++    #[test]
++    fn explicit_used_percent_colors_countdown_segments() {
++        let line = status_line_from_segments_with_usage(
++            [
++                (
++                    StatusLineItem::WeeklyLimit,
++                    "weekly █░░░░░░░░░ 14% (resets in 6d 21h)".to_string(),
++                    Some(14),
++                ),
++                (
++                    StatusLineItem::FiveHourLimit,
++                    "5h █████████░ 92% (resets in 3h 20m)".to_string(),
++                    Some(92),
++                ),
++            ],
++            /*use_theme_colors*/ true,
++        )
++        .expect("status line");
++
++        assert_eq!(
++            line_text(&line),
++            "weekly █░░░░░░░░░ 14% (resets in 6d 21h) · 5h █████████░ 92% (resets in 3h 20m)"
++        );
++        assert_eq!(line.spans[0].style.fg, Some(UsageLevel::Healthy.color()));
++        assert_eq!(line.spans[2].style.fg, Some(UsageLevel::Critical.color()));
+     }
+ 
+     #[test]
++    fn countdown_without_explicit_usage_keeps_theme_colors() {
++        let line = status_line_from_segments_with_resolver(
++            [(
++                StatusLineItem::WeeklyLimit,
++                "weekly █░░░░░░░░░ 14% (resets in 6d 21h)".to_string(),
++            )],
++            /*use_theme_colors*/ true,
++            |_| Some(Style::default().red()),
++        )
++        .expect("status line");
++
++        assert_eq!(line.spans[0].style.fg, Some(Color::Red));
++    }
++
++    #[test]
+     fn quota_segments_without_percent_keep_theme_colors() {
+         let line = status_line_from_segments_with_resolver(
+             [

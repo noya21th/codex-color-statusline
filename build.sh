@@ -9,7 +9,6 @@ export PATH="${HOME}/.cargo/bin:${PATH}"
 
 VER="$(resolve_version "${1:-}")"
 SRC="${WORK}/codex-rust-v${VER}"
-PATCH="${HERE}/patches/${PATCH_NAME}"
 
 command -v rustup >/dev/null || { echo "❌ rustup not found, install Rust first: https://rustup.rs / 没找到 rustup,先装 Rust"; exit 1; }
 mkdir -p "${WORK}"
@@ -20,15 +19,19 @@ if [ ! -d "${SRC}" ]; then
 fi
 
 cd "${SRC}"
-if git apply --check -R "${PATCH}" 2>/dev/null; then
-  echo "== Patch already applied / 补丁已在源码里"
-elif git apply --check "${PATCH}" 2>/dev/null; then
-  echo "== Applying patch / 套补丁"
-  git apply "${PATCH}"
-else
-  echo "❌ Patch does not apply to ${VER}: upstream changed the footer styling code / 补丁套不上 ${VER},上游改了底栏着色代码" >&2
-  exit 1
-fi
+for PATCH_FILE in "${PATCH_NAMES[@]}"; do
+  PATCH="${HERE}/patches/${PATCH_FILE}"
+  if git apply --check -R "${PATCH}" 2>/dev/null; then
+    echo "== Patch already applied / 补丁已在源码里: ${PATCH_FILE}"
+  elif git apply --check "${PATCH}" 2>/dev/null; then
+    echo "== Applying patch / 套补丁: ${PATCH_FILE}"
+    git apply "${PATCH}"
+  else
+    echo "❌ Patch does not apply to ${VER} / 补丁套不上 ${VER}: ${PATCH_FILE}" >&2
+    echo "   Upstream changed the code this patch touches / 上游改了这个补丁碰的代码,需要重新适配" >&2
+    exit 1
+  fi
+done
 
 cd "${SRC}/codex-rs"
 # 按 rust-toolchain.toml 装好 Codex 指定的 Rust 版本
@@ -56,7 +59,7 @@ PY
 echo "== Building, the first build takes a while / 编译(首次较久)"
 cargo build --release --locked -p codex-cli --bin codex
 echo "== Running patch tests / 跑补丁单测"
-cargo test --release --locked -p codex-tui --lib status_line_style
+cargo test --release --locked -p codex-tui --lib status_line
 
 "${SRC}/codex-rs/target/release/codex" --version
 echo "✅ Built / 编译完成: ${SRC}/codex-rs/target/release/codex"

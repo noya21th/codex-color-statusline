@@ -1,7 +1,11 @@
 # build.sh / install.sh / uninstall.sh 共用
 WORK="${HOME}/.cache/codex-color-build"
 STANDALONE="${HOME}/.codex/packages/standalone"
-PATCH_NAME="status-line-threshold-colors.patch"
+# 按顺序套用:先阈值配色,再把 weekly 换成重置倒计时(倒计时补丁建立在配色补丁之上)
+PATCH_NAMES=(
+  "status-line-threshold-colors.patch"
+  "status-line-weekly-countdown.patch"
+)
 
 # 给了版本号就用它,否则取官方 current 指向的版本(如 0.154.0)
 resolve_version() {
