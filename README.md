@@ -18,7 +18,7 @@ gpt-5.6-sol high · Context 0% used · 5h ░░░░░░░░░░ 5% (res
 <p align="center">
   <img src="docs/preview.png" alt="Simulated Codex status lines at different usage levels" width="100%">
 </p>
-<p align="center"><sub>Simulated preview of the color thresholds. Top line: official colors. Below: the patched status line at different usage levels.</sub></p>
+<p align="center"><sub>Simulated preview. Top row: the official status line for that exact usage. Below: the same quota after patching, at four levels of usage.</sub></p>
 
 Codex already shows `Context N% used`, `5h N% left` and `weekly N% left` in its footer, but it colors each item by type, so the color never changes as you run low, and it never tells you *when* a limit resets — for that you have to run `/status`. There is no setting for either, so this project rebuilds Codex from the official source.
 
@@ -78,6 +78,29 @@ Context is per conversation. The 5h and weekly limits are shared by your whole a
 **A Codex update silently puts you back on the official binary.** It installs into a new version folder and repoints `current`, so nothing breaks — but the colors and the meters are gone, with no warning. If the status line stops reacting to your usage, that is what happened.
 
 Run `./build.sh && ./install.sh` again. If `build.sh` says a patch does not apply, upstream changed the code it touches and the patch needs an update.
+
+## FAQ
+
+**When does my Codex weekly limit reset?**
+After patching, the status line says so directly: `weekly █░░░░░░░░░ 15% (resets in 18h 58m)`. Without it you have to run `/status` and read the reset time off the card. The weekly window is a fixed 7-day window that resets all at once — it is not a rolling window that decays.
+
+**Why doesn't the Codex CLI status line change color as I run out of quota?**
+Because upstream colors each item by *type*, not by value — the 5h and weekly items share one color no matter what the numbers say, and `status_line_use_colors` is only an on/off switch. There is no setting for threshold colors; that is what the first patch adds.
+
+**Can I customize the Codex CLI status line with a script?**
+No. Unlike Claude Code's `statusLine`, Codex only lets you pick from built-in items in `[tui] status_line` — there is no hook for a custom command. That is why this project patches and rebuilds the source instead.
+
+**Where does the usage data come from?**
+From the rate-limit snapshot Codex already receives alongside its replies — the same numbers `/status` shows. Nothing extra is requested, and no data leaves your machine.
+
+**Why does the percentage now count up instead of down?**
+Upstream shows headroom (`weekly 85% left`); the patch shows consumption (`weekly 15%`), so the number moves in the same direction as the bar beside it and as `Context N% used`.
+
+**Does it work on Linux or Windows?**
+The patches themselves are platform-independent — they only touch the TUI crate. The build and install scripts assume the macOS standalone layout (`~/.codex/packages/standalone`), so other platforms need their own install scripts.
+
+**Will a Codex update remove it?**
+Yes, silently. See [After updating Codex](#after-updating-codex).
 
 ## How it works
 
